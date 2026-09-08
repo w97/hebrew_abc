@@ -304,7 +304,20 @@ html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#9bd2ee}
 #hebrew-build-badge{position:fixed;left:8px;top:6px;z-index:2147483646;font:9px Arial;color:#314a59;background:#ffffff99;padding:3px 5px;border-radius:3px;direction:ltr;pointer-events:none}
 #portrait-lock-overlay{position:fixed;inset:0;z-index:2147483645;display:none;align-items:center;justify-content:center;text-align:center;padding:32px;box-sizing:border-box;background:#111;color:white;font:700 24px/1.4 Arial;direction:rtl}
 @media(orientation:portrait){#portrait-lock-overlay{display:flex}#contentWrapper{visibility:hidden}}
-</style><div id="portrait-lock-overlay">↻<br>סובבו את המכשיר לרוחב כדי לשחק</div><button id="fs-demo-btn" type="button">Fullscreen</button><div id="hebrew-build-badge">v2.6.3-he-17 · 2026-09-08 11:50 IDT</div><script>
+#tilt-status{
+ position:fixed;
+ left:8px;
+ bottom:8px;
+ z-index:2147483647;
+ font:11px/1.2 Arial,sans-serif;
+ color:#fff;
+ background:rgba(0,0,0,.58);
+ padding:4px 6px;
+ border-radius:4px;
+ direction:ltr;
+ pointer-events:none;
+}
+</style><div id="portrait-lock-overlay">↻<br>סובבו את המכשיר לרוחב כדי לשחק</div><button id="fs-demo-btn" type="button">Fullscreen</button><div id="tilt-status">tilt: starting…</div><div id="hebrew-build-badge">v2.6.3-he-19 · 2026-09-08 12:14 IDT</div><script>
 (function(){
 "use strict";
 const BASE_W=1024, BASE_H=768;
@@ -353,6 +366,7 @@ window.__hebrewResponsive=api;
 const btn=document.getElementById("fs-demo-btn");
 function fullscreen(){return !!(document.fullscreenElement||document.webkitFullscreenElement)}
 async function enterFullscreen(){
+ if(window.__hebrewTilt) window.__hebrewTilt.request();
  const el=document.documentElement;
  const request=el.requestFullscreen||el.webkitRequestFullscreen;
  if(!request){btn.textContent="Fullscreen unsupported";return}
@@ -370,7 +384,168 @@ document.addEventListener("webkitfullscreenchange",()=>{sync();api.schedule()});
 for(const event of ["resize","orientationchange","pageshow"])
  window.addEventListener(event,api.schedule);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)api.schedule()});
+
 if(window.visualViewport)visualViewport.addEventListener("resize",api.schedule);
+
+/* Mobile tilt physics + live diagnostics.
+   This version explicitly requests sensor permission from the Fullscreen tap,
+   shows whether events are actually arriving, and wakes sleeping Matter bodies. */
+const tilt={
+ enabled:false,
+ permission:"unknown",
+ smoothX:0,
+ smoothY:1,
+ lastMotion:0,
+ lastOrientation:0,
+ samples:0,
+ timer:null,
+ isMobile(){
+  return navigator.maxTouchPoints>0 ||
+    /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+ },
+ screenAngle(){
+  if(screen.orientation && typeof screen.orientation.angle==="number") return screen.orientation.angle;
+  if(typeof window.orientation==="number") return window.orientation;
+  return 0;
+ },
+ clamp(v,min,max){return Math.max(min,Math.min(max,v))},
+ rotateToScreen(x,y){
+  const a=tilt.screenAngle()*Math.PI/180;
+  const c=Math.cos(a), q=Math.sin(a);
+  return {x:x*c+y*q,y:-x*q+y*c};
+ },
+ scene(){
+  if(!game||!game.scene||!game.scene.getScene)return null;
+  try{return game.scene.getScene("Game")}catch(e){return null}
+ },
+ world(){
+  const scene=tilt.scene();
+  return scene&&scene.matter&&scene.matter.world?scene.matter.world:null;
+ },
+ status(text){
+  const badge=document.getElementById("tilt-status");
+  if(badge) badge.textContent=text;
+ },
+ wakeBodies(){
+  const world=tilt.world();
+  if(!world||!world.engine||!world.engine.world)return;
+  const bodies=world.engine.world.bodies||[];
+  for(const body of bodies){
+    if(!body||body.isStatic)continue;
+    body.isSleeping=false;
+    body.sleepCounter=0;
+  }
+ },
+ apply(x,y,source){
+  const world=tilt.world();
+  if(!world){
+    tilt.status("tilt: sensor OK · waiting for game");
+    return;
+  }
+  if(Math.abs(x)<0.025)x=0;
+  if(Math.abs(y)<0.025)y=0;
+  tilt.smoothX=tilt.smoothX*.70+x*.30;
+  tilt.smoothY=tilt.smoothY*.70+y*.30;
+  // Strong enough to be obvious while testing.
+  world.setGravity(tilt.smoothX,tilt.smoothY,0.0024);
+  tilt.wakeBodies();
+  tilt.samples++;
+  if(tilt.samples%4===0){
+    tilt.status(
+      "tilt "+source+": "+
+      tilt.smoothX.toFixed(2)+", "+tilt.smoothY.toFixed(2)
+    );
+  }
+ },
+ motion(e){
+  const a=e.accelerationIncludingGravity;
+  if(!a||a.x==null||a.y==null)return;
+  tilt.lastMotion=performance.now();
+  const p=tilt.rotateToScreen(a.x,a.y);
+  tilt.apply(
+    tilt.clamp(p.x/9.81,-1.8,1.8),
+    tilt.clamp(p.y/9.81,-1.8,1.8),
+    "motion"
+  );
+ },
+ orientation(e){
+  if(e.beta==null||e.gamma==null)return;
+  tilt.lastOrientation=performance.now();
+  // Prefer real gravity if DeviceMotion is currently flowing.
+  if(performance.now()-tilt.lastMotion<700)return;
+  const p=tilt.rotateToScreen(e.gamma,e.beta);
+  tilt.apply(
+    tilt.clamp(p.x/32,-1.6,1.6),
+    tilt.clamp(p.y/32,-1.6,1.6),
+    "orientation"
+  );
+ },
+ listen(){
+  if(tilt.enabled)return;
+  tilt.enabled=true;
+  tilt.status("tilt: waiting for sensor…");
+  window.addEventListener("devicemotion",tilt.motion,{passive:true});
+  window.addEventListener("deviceorientation",tilt.orientation,{passive:true});
+  clearTimeout(tilt.timer);
+  tilt.timer=setTimeout(()=>{
+    if(!tilt.lastMotion&&!tilt.lastOrientation){
+      tilt.status(
+        window.isSecureContext
+          ? "tilt: no sensor events"
+          : "tilt: blocked here · try HTTPS"
+      );
+    }
+  },2500);
+ },
+ async request(){
+  if(!tilt.isMobile()){
+    tilt.status("tilt: mobile only");
+    return;
+  }
+  try{
+    let granted=true;
+    if(typeof DeviceMotionEvent!=="undefined" &&
+       typeof DeviceMotionEvent.requestPermission==="function"){
+      granted=(await DeviceMotionEvent.requestPermission())==="granted";
+    }
+    if(granted &&
+       typeof DeviceOrientationEvent!=="undefined" &&
+       typeof DeviceOrientationEvent.requestPermission==="function"){
+      granted=(await DeviceOrientationEvent.requestPermission())==="granted";
+    }
+    tilt.permission=granted?"granted":"denied";
+    if(granted)tilt.listen();
+    else tilt.status("tilt: permission denied");
+  }catch(e){
+    tilt.permission="error";
+    tilt.status("tilt: permission error");
+  }
+ }
+};
+window.__hebrewTilt=tilt;
+
+// Android usually starts without a permission dialog.
+// iOS needs requestPermission() from a user gesture.
+if(tilt.isMobile()){
+  const needsPermission=
+    (typeof DeviceMotionEvent!=="undefined" &&
+     typeof DeviceMotionEvent.requestPermission==="function") ||
+    (typeof DeviceOrientationEvent!=="undefined" &&
+     typeof DeviceOrientationEvent.requestPermission==="function");
+  if(needsPermission){
+    tilt.status("tilt: tap Fullscreen to enable");
+  }else{
+    tilt.listen();
+  }
+}else{
+  tilt.status("tilt: mobile only");
+}
+
+window.addEventListener("orientationchange",()=>{
+ tilt.smoothX=0;
+ tilt.smoothY=1;
+});
+
 api.schedule();
 })();
 </script></body>
