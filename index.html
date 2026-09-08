@@ -145,94 +145,151 @@ body{position:fixed;inset:0}
 (function(){
   "use strict";
   var rawBeta=0, rawGamma=0, screenTilt=0, active=false;
-  var MAX_TILT=45;      // degrees needed for full sideways gravity
-  var SIDE_GRAVITY=1.75;
-  var DOWN_GRAVITY=1.65;
-  var GRAVITY_SCALE=0.001;
+  var MAX_TILT=42;
+  var SIDE_ACCEL=0.20;
+  var DOWN_ACCEL=0.24;
+  var MAX_X_SPEED=10;
+  var MAX_Y_SPEED=12;
+  var FLOOR_THICKNESS=80;
+  var WALL_THICKNESS=80;
 
   function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
   function orientationAngle(){
     var a=0;
-    try {
+    try{
       if(screen.orientation && typeof screen.orientation.angle === "number") a=screen.orientation.angle;
       else if(typeof window.orientation === "number") a=window.orientation;
-    } catch(e){}
-    a=((a%360)+360)%360;
-    return a;
+    }catch(e){}
+    return ((a%360)+360)%360;
   }
+
   function calculateScreenTilt(){
     var a=orientationAngle(), x;
-    // DeviceOrientation beta/gamma axes are portrait-based. Convert the
-    // relevant axis to the screen's horizontal axis so landscape works too.
     if(a===90) x=rawBeta;
     else if(a===270) x=-rawBeta;
     else if(a===180) x=-rawGamma;
     else x=rawGamma;
     screenTilt=clamp(x/MAX_TILT,-1,1);
   }
+
   function onOrientation(e){
     if(typeof e.beta === "number") rawBeta=e.beta;
     if(typeof e.gamma === "number") rawGamma=e.gamma;
     calculateScreenTilt();
     active=true;
   }
+
   function listen(){
     window.removeEventListener("deviceorientation",onOrientation,true);
     window.addEventListener("deviceorientation",onOrientation,true);
   }
+
   function requestPermission(){
-    try {
+    try{
       if(window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === "function"){
-        DeviceOrientationEvent.requestPermission().then(function(state){ if(state==="granted") listen(); }).catch(function(){});
-      } else listen();
-    } catch(e){ listen(); }
+        DeviceOrientationEvent.requestPermission().then(function(state){
+          if(state==="granted") listen();
+        }).catch(function(){});
+      }else listen();
+    }catch(e){ listen(); }
   }
-  // Android starts immediately. iOS requires this to happen from a real gesture.
+
   listen();
   document.addEventListener("pointerdown",requestPermission,{capture:true,once:true});
-  window.addEventListener("orientationchange",function(){ setTimeout(calculateScreenTilt,80); });
+  window.addEventListener("orientationchange",function(){ setTimeout(calculateScreenTilt,100); });
   if(screen.orientation && screen.orientation.addEventListener){
     screen.orientation.addEventListener("change",calculateScreenTilt);
   }
 
-  function tuneBody(body){
-    if(!body) return;
-    // A little grip and very little air resistance makes the square blocks
-    // roll/tumble along the floor instead of sliding forever.
-    body.friction=0.22;
-    body.frictionStatic=0.35;
-    body.frictionAir=0.008;
-    body.restitution=0.08;
+  function getSize(scene){
+    var w=0,h=0;
+    try{
+      if(scene.cameras && scene.cameras.main){
+        w=scene.cameras.main.width || 0;
+        h=scene.cameras.main.height || 0;
+      }
+      if((!w || !h) && scene.scale && scene.scale.gameSize){
+        w=scene.scale.gameSize.width || w;
+        h=scene.scale.gameSize.height || h;
+      }
+      if(!w) w=960;
+      if(!h) h=640;
+    }catch(e){ w=960; h=640; }
+    return {w:w,h:h};
+  }
+
+  function ensureBounds(scene){
+    if(!scene.matter || !scene.matter.add) return;
+    var z=getSize(scene), b=scene.__hebrewPhysicsBounds;
+    if(b && b.w===z.w && b.h===z.h) return;
+    try{
+      if(b){
+        [b.floor,b.left,b.right].forEach(function(x){
+          if(x && scene.matter.world) scene.matter.world.remove(x);
+        });
+      }
+      var opts={isStatic:true,friction:0.35,restitution:0.05,label:"hebrewTiltBoundary"};
+      var floor=scene.matter.add.rectangle(z.w/2,z.h+FLOOR_THICKNESS/2,z.w+WALL_THICKNESS*2,FLOOR_THICKNESS,opts);
+      var left=scene.matter.add.rectangle(-WALL_THICKNESS/2,z.h/2,WALL_THICKNESS,z.h*3,opts);
+      var right=scene.matter.add.rectangle(z.w+WALL_THICKNESS/2,z.h/2,WALL_THICKNESS,z.h*3,opts);
+      scene.__hebrewPhysicsBounds={w:z.w,h:z.h,floor:floor,left:left,right:right};
+    }catch(e){}
+  }
+
+  function isLooseBlock(block){
+    return block && block.body && !block.isPlaced;
+  }
+
+  function tuneAndDrive(scene,block){
+    if(!isLooseBlock(block)) return;
+    var body=block.body;
+    try{
+      body.friction=0.30;
+      body.frictionStatic=0.45;
+      body.frictionAir=0.012;
+      body.restitution=0.08;
+
+      var vx=(body.velocity && body.velocity.x)||0;
+      var vy=(body.velocity && body.velocity.y)||0;
+      vx=clamp(vx + screenTilt*SIDE_ACCEL,-MAX_X_SPEED,MAX_X_SPEED);
+      vy=clamp(vy + DOWN_ACCEL,-MAX_Y_SPEED,MAX_Y_SPEED);
+
+      if(scene.matter.body && scene.matter.body.setVelocity){
+        scene.matter.body.setVelocity(body,{x:vx,y:vy});
+      }else if(window.Phaser && Phaser.Physics && Phaser.Physics.Matter && Phaser.Physics.Matter.Matter){
+        Phaser.Physics.Matter.Matter.Body.setVelocity(body,{x:vx,y:vy});
+      }
+    }catch(e){}
   }
 
   function applyPhysics(){
     var game=window.__hebrewPhaserGame;
     if(game && game.scene){
-      try {
+      try{
         var scenes=game.scene.getScenes(true);
         for(var i=0;i<scenes.length;i++){
           var scene=scenes[i];
           if(!scene.matter || !scene.matter.world) continue;
-          // Down is ALWAYS toward the bottom of the game. Tilting only adds
-          // left/right gravity, so the blocks stay grounded and roll sideways.
-          scene.matter.world.setGravity(screenTilt*SIDE_GRAVITY,DOWN_GRAVITY,GRAVITY_SCALE);
+
+          // Never rotate/invert gravity with device orientation. World gravity is
+          // disabled and loose blocks are driven explicitly toward screen-bottom.
+          try{ scene.matter.world.setGravity(0,0,0.001); }catch(e){}
+          ensureBounds(scene);
+
           if(scene.blocks && scene.blocks.length){
-            for(var j=0;j<scene.blocks.length;j++){
-              var block=scene.blocks[j];
-              if(block && block.body && !block.isPlaced) tuneBody(block.body);
-            }
+            for(var j=0;j<scene.blocks.length;j++) tuneAndDrive(scene,scene.blocks[j]);
           }
         }
-      } catch(e){}
+      }catch(e){}
     }
     requestAnimationFrame(applyPhysics);
   }
   requestAnimationFrame(applyPhysics);
 
-  // Expose current value for quick diagnostics from the browser console.
   window.__hebrewTiltPhysics={
     get tilt(){ return screenTilt; },
     get active(){ return active; },
+    get orientation(){ return orientationAngle(); },
     recalibrate:function(){ rawBeta=0; rawGamma=0; screenTilt=0; }
   };
 })();
